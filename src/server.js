@@ -48,6 +48,12 @@ function assertConfig() {
     fail('MAX_DAILY_SATS must be >= 0');
   if (!CFG.logPath.startsWith('/'))
     console.warn(`WARN: PAYMENT_LOG_PATH is relative (${CFG.logPath}) — it lands in the process cwd; set an absolute path in production.`);
+  // Invariant: the daily window must never block a payment the per-payment cap
+  // explicitly allows. If misconfigured low, raise it and say so.
+  if (CFG.maxDailySats > 0 && CFG.maxDailySats < CFG.maxPaymentSats) {
+    console.warn(`WARN: MAX_DAILY_SATS (${CFG.maxDailySats}) < MAX_PAYMENT_SATS (${CFG.maxPaymentSats}) — effective daily cap raised to ${CFG.maxPaymentSats}`);
+    CFG.maxDailySats = CFG.maxPaymentSats;
+  }
 }
 
 // ------------------------------------------------------------- helpers
