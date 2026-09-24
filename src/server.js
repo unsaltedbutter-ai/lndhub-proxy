@@ -32,6 +32,8 @@ const CFG = {
   password: process.env.LNDHUB_PASSWORD ?? '',
   maxPaymentSats: Number(process.env.MAX_PAYMENT_SATS ?? 250000),
   maxDailySats: Number(process.env.MAX_DAILY_SATS ?? 0),  // 0 = disabled
+  feePct: Number(process.env.FEE_LIMIT_PCT ?? 1),        // routing-fee budget: % of amount
+  feeFloorSat: Number(process.env.FEE_LIMIT_FLOOR_SATS ?? 1000),  // ...with this floor
   logPath: process.env.PAYMENT_LOG_PATH ?? './payments.log',
 };
 
@@ -312,8 +314,9 @@ async function payBolt11(bolt11, reply) {
   audit({ event: 'pay_attempt', amt_sat: amtSat, payment_hash: decoded.payment_hash, destination: decoded.destination });
   try {
     // F2: LND's default routing-fee budget is ~0 sats, so multi-hop payments would
-    // fail NO_ROUTE. Allow 1% of amount (floor 1000 sats, ceiling 5000 sats).
-    const feeLimitSat = Math.min(5000, Math.max(1000, Math.ceil(amtSat * 0.01)));
+    // fail NO_ROUTE. Budget = max(floor, pct of amount). No ceiling: pct-of-amount
+    // is already bounded by the amount, and a ceiling would only fail big payments.
+    const feeLimitSat = Math.max(CFG.feeFloorSat, Math.ceil(amtSat * CFG.feePct / 100));
     const res = await lnd('POST', '/v2/router/send', {
       payment_request: bolt11,
       timeout_seconds: 120,
