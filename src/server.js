@@ -100,7 +100,7 @@ function rateLimited(ip, max = 60) {
 
 // trustProxy: nginx sets X-Forwarded-For; without this every request looks like 127.0.0.1
 // and the per-IP limiter would DoS itself. Header is set by OUR nginx on loopback only.
-const app = Fastify({ logger: false, bodyLimit: 64 * 1024, trustProxy: true });
+const app = Fastify({ logger: false, bodyLimit: 64 * 1024, trustProxy: true, maxParamLength: 2000 });
 
 // --- auth: the LNDhub token IS the credential ("login:password"), no sessions/db.
 app.addHook('onRequest', async (req, reply) => {
@@ -214,7 +214,8 @@ app.post('/api/addinvoice', async (req, reply) => {
 
 // --- GET /api/getuserinvoices -> incoming invoices
 app.get('/api/getuserinvoices', async () => {
-  const { invoices = [] } = await lnd('GET', '/v1/invoices');
+  // reverse=true: without it, v1 returns the OLDEST 100 and new invoices never show up
+  const { invoices = [] } = await lnd('GET', '/v1/invoices?reverse=true&num_max_invoices=100');
   return invoices.map((i) => ({
     r_hash: b64hex(i.r_hash),
     payment_request: i.payment_request,
@@ -232,7 +233,7 @@ app.get('/api/getuserinvoices', async () => {
 app.get('/api/gettxs', async (req) => {
   const limit = Math.min(Number(req.query.limit ?? 100), 500);
   const offset = Number(req.query.offset ?? 0);
-  const all = await lnd('GET', '/v1/payments');
+  const all = await lnd('GET', '/v1/payments?max_payments=500');
   const payments = (all.payments ?? []).filter((p) => p.status === 'SUCCEEDED').slice(offset, offset + limit);
   return payments.map((p) => ({
     type: 'paid_invoice',
