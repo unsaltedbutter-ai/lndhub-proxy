@@ -70,7 +70,10 @@ async function lnd(method, path, body) {
   const text = await res.text();
   let json; try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
   if (!res.ok) {
-    const err = new Error(json?.error ?? `lnd http ${res.status}`);
+    // LND errors: {error: "..."} (legacy) or {error: {code, message}} (v2) or {message}
+    const msg = (typeof json?.error === 'object' ? json.error.message : json?.error)
+      ?? json?.message ?? `lnd http ${res.status}`;
+    const err = new Error(msg);
     err.status = res.status; err.body = json; throw err;
   }
   return json;
@@ -310,4 +313,11 @@ app.setNotFoundHandler((req, reply) => {
 assertConfig();
 app.listen({ host: CFG.host, port: CFG.port }).then(() => {
   console.log(`lndhub-proxy listening on http://${CFG.host}:${CFG.port}/api  (lnd: ${CFG.lndUrl}, cap: ${CFG.maxPaymentSats || 'uncapped'} sats)`);
-}).catch((e) => { console.error(e); process.exit(1); });
+}).catch((e) => {
+  if (e && (e.code === 'EADDRINUSE' || /EADDRINUSE/.test(String(e.message)))) {
+    // A live instance already owns the port — that IS the health answer. Exit clean.
+    console.log(`lndhub-proxy: port ${CFG.port} already bound by another instance; exiting quietly.`);
+    process.exit(0);
+  }
+  console.error(e); process.exit(1);
+});
