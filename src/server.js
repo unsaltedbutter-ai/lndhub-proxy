@@ -32,7 +32,7 @@ const CFG = {
   password: process.env.LNDHUB_PASSWORD ?? '',
   maxPaymentSats: Number(process.env.MAX_PAYMENT_SATS ?? 250000),
   maxDailySats: Number(process.env.MAX_DAILY_SATS ?? 0),  // 0 = disabled
-  feePct: Number(process.env.FEE_LIMIT_PCT ?? 1),        // routing-fee budget: % of amount
+  feePct: Number(process.env.FEE_LIMIT_PCT ?? 3),        // routing-fee budget: % of amount
   feeFloorSat: Number(process.env.FEE_LIMIT_FLOOR_SATS ?? 1000),  // ...with this floor
   logPath: process.env.PAYMENT_LOG_PATH ?? './payments.log',
 };

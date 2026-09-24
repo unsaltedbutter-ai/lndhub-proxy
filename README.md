@@ -63,6 +63,8 @@ Defense in depth:
 | `LNDHUB_LOGIN` | — | required; >= 128 bits |
 | `LNDHUB_PASSWORD` | — | required; exactly 256-bit hex enforced |
 | `MAX_PAYMENT_SATS` | `250000` | `0` = uncapped |
+| `FEE_LIMIT_PCT` | `3` | routing-fee budget, % of amount (floats OK) |
+| `FEE_LIMIT_FLOOR_SATS` | `1000` | minimum fee budget in sats |
 | `PAYMENT_LOG_PATH` | `./payments.log` | |
 
 Generate credentials:
