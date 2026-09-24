@@ -33,7 +33,7 @@ function dynamic(req) {
   const u = req.url;
   if (u.startsWith('/v1/payreq/')) {
     const bolt = decodeURIComponent(u.slice('/v1/payreq/'.length));
-    const amt = bolt === 'lnbcVALID' ? '20000' : bolt === 'lnbcSMALL' ? '5000' : null;
+    const amt = bolt === 'lnbcVALID' ? '20000' : bolt === 'lnbcSMALL' ? '5000' : bolt === 'lnbcFAILS' ? '6000' : null;
     if (!amt) return { status: 400, body: { error: 'nope' } };
     return { status: 200, body: { destination: '03bb', payment_hash: 'ff00', num_satoshis: amt, timestamp: '1700000000', expiry: '3600', description: 'test', cltv_expiry: '80' } };
   }
@@ -126,6 +126,13 @@ try {
   // F3: query-string token no longer accepted (was a log-leak path)
   r = await fetch(`${B}/balance?access_token=${LOGIN}:${PASSWORD}`);
   ok('F3: query-string token rejected', r.status === 401);
+
+  // F6: prefix-exemption closed — /api/authx must NOT inherit the auth exemption
+  r = await fetch(`${B}/authx`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}' });
+  ok('F6: /api/authx not exempt from auth (401)', r.status === 401);
+  // F1: FAILED NDJSON (single result line) -> 502 with real reason
+  r = await call('POST', '/payinvoice', { body: { invoice: 'lnbcFAILS' } });
+  ok('F1: FAILED stream -> 502 + reason', r.status === 502);
 
   // allow-by-construction: no passthrough to unlocker or anything else
   r = await call('GET', '/v1/changepassword');

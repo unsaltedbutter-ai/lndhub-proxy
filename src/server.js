@@ -48,8 +48,12 @@ function assertConfig() {
     fail('MAX_PAYMENT_SATS must be >= 0');
   if (!Number.isFinite(CFG.maxDailySats) || CFG.maxDailySats < 0)
     fail('MAX_DAILY_SATS must be >= 0');
+  // F5: the audit log is the post-incident record for credential-theft drainage —
+  // it must not silently relocate or fail. Boot-critical, like the other checks.
   if (!CFG.logPath.startsWith('/'))
-    console.warn(`WARN: PAYMENT_LOG_PATH is relative (${CFG.logPath}) — it lands in the process cwd; set an absolute path in production.`);
+    fail(`PAYMENT_LOG_PATH must be absolute (got ${CFG.logPath})`);
+  try { appendFileSync(CFG.logPath, ''); }
+  catch (e) { fail(`PAYMENT_LOG_PATH not writable (${CFG.logPath}): ${e.message}`); }
   // Invariant: the daily window must never block a payment the per-payment cap
   // explicitly allows. If misconfigured low, raise it and say so.
   if (CFG.maxDailySats > 0 && CFG.maxDailySats < CFG.maxPaymentSats) {
@@ -137,9 +141,11 @@ function rateLimited(ip, max = 60) {
 
 // ---------------------------------------------------------------- server
 
-// trustProxy: nginx sets X-Forwarded-For; without this every request looks like 127.0.0.1
-// and the per-IP limiter would DoS itself. Header is set by OUR nginx on loopback only.
-const app = Fastify({ logger: false, bodyLimit: 64 * 1024, trustProxy: true, routerOptions: { maxParamLength: 2000 } });
+// trustProxy: 1 = trust exactly ONE proxy hop. Our nginx uses $proxy_add_x_forwarded_for,
+// which APPENDS the real peer IP; with hop-count 1, req.ip is the nginx-appended value and
+// client-supplied XFF entries are ignored. (trustProxy:true would take the LEFTMOST value,
+// which is attacker-chosen — F3.)
+const app = Fastify({ logger: false, bodyLimit: 64 * 1024, trustProxy: 1, routerOptions: { maxParamLength: 2000 } });
 
 // --- auth: the LNDhub token IS the credential ("login:password"), no sessions/db.
 app.addHook('onRequest', async (req, reply) => {
@@ -311,12 +317,12 @@ async function payBolt11(bolt11, reply) {
   if (CFG.maxDailySats > 0 && spentToday() + amtSat > CFG.maxDailySats)
     return reply.code(400).send({ error: true, code: 2, message: `daily cap: ${spentToday()} + ${amtSat} exceeds MAX_DAILY_SATS=${CFG.maxDailySats}` });
 
-  audit({ event: 'pay_attempt', amt_sat: amtSat, payment_hash: decoded.payment_hash, destination: decoded.destination });
+  // F2: LND's default routing-fee budget is ~0 sats, so multi-hop payments would
+  // fail NO_ROUTE. Budget = max(floor, pct of amount). No ceiling: pct-of-amount
+  // is already bounded by the amount, and a ceiling would only fail big payments.
+  const feeLimitSat = Math.max(CFG.feeFloorSat, Math.ceil(amtSat * CFG.feePct / 100));
+  audit({ event: 'pay_attempt', amt_sat: amtSat, fee_limit_sat: feeLimitSat, payment_hash: decoded.payment_hash, destination: decoded.destination });
   try {
-    // F2: LND's default routing-fee budget is ~0 sats, so multi-hop payments would
-    // fail NO_ROUTE. Budget = max(floor, pct of amount). No ceiling: pct-of-amount
-    // is already bounded by the amount, and a ceiling would only fail big payments.
-    const feeLimitSat = Math.max(CFG.feeFloorSat, Math.ceil(amtSat * CFG.feePct / 100));
     const res = await lnd('POST', '/v2/router/send', {
       payment_request: bolt11,
       timeout_seconds: 120,
