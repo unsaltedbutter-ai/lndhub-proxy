@@ -31,6 +31,7 @@ const CFG = {
   login: process.env.LNDHUB_LOGIN ?? '',
   password: process.env.LNDHUB_PASSWORD ?? '',
   maxPaymentSats: Number(process.env.MAX_PAYMENT_SATS ?? 250000),
+  maxDailySats: Number(process.env.MAX_DAILY_SATS ?? 0),  // 0 = disabled
   logPath: process.env.PAYMENT_LOG_PATH ?? './payments.log',
 };
 
@@ -43,6 +44,10 @@ function assertConfig() {
   if (CFG.password.length < 64) fail('LNDHUB_PASSWORD too short (want 256-bit hex)');
   if (!Number.isFinite(CFG.maxPaymentSats) || CFG.maxPaymentSats < 0)
     fail('MAX_PAYMENT_SATS must be >= 0');
+  if (!Number.isFinite(CFG.maxDailySats) || CFG.maxDailySats < 0)
+    fail('MAX_DAILY_SATS must be >= 0');
+  if (!CFG.logPath.startsWith('/'))
+    console.warn(`WARN: PAYMENT_LOG_PATH is relative (${CFG.logPath}) — it lands in the process cwd; set an absolute path in production.`);
 }
 
 // ------------------------------------------------------------- helpers
@@ -68,7 +73,18 @@ async function lnd(method, path, body) {
     signal: AbortSignal.timeout(30_000),
   });
   const text = await res.text();
-  let json; try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
+  let json;
+  try { json = text ? JSON.parse(text) : {}; }
+  catch {
+    // F1: server-streaming REST endpoints (e.g. /v2/router/send) return NDJSON:
+    // one {"result": {...}} per line, final event is authoritative. Take the
+    // LAST parseable line. (A single JSON.parse of the whole body throws here —
+    // which previously turned SUCCEEDED payments into 502 "not settled".)
+    json = {};
+    for (const line of (text ?? '').split('\n').reverse()) {
+      try { json = JSON.parse(line); if (Object.keys(json).length) break; } catch { /* keep scanning */ }
+    }
+  }
   if (!res.ok) {
     // LND errors: {error: "..."} (legacy) or {error: {code, message}} (v2) or {message}
     const msg = (typeof json?.error === 'object' ? json.error.message : json?.error)
@@ -76,6 +92,9 @@ async function lnd(method, path, body) {
     const err = new Error(msg);
     err.status = res.status; err.body = json; throw err;
   }
+  // unwrap streaming envelope {result:{...}} -> {...}
+  if (json && typeof json === 'object' && 'result' in json && Object.keys(json).length === 1)
+    json = json.result;
   return json;
 }
 
@@ -86,6 +105,15 @@ function audit(entry) {
   const line = JSON.stringify({ ts: new Date().toISOString(), ...entry });
   try { appendFileSync(CFG.logPath, line + '\n'); }
   catch { try { mkdirSync(dirname(CFG.logPath), { recursive: true }); appendFileSync(CFG.logPath, line + '\n'); } catch (e) { console.error('audit log failed:', e.message); } }
+}
+
+// --- F4: rolling 24h aggregate spend window (in-memory; resets on restart)
+const spendWindow = [];
+function recordSpend(sat) { spendWindow.push({ sat, t: Date.now() }); }
+function spentToday() {
+  const cutoff = Date.now() - 24 * 3600_000;
+  while (spendWindow.length && spendWindow[0].t < cutoff) spendWindow.shift();
+  return spendWindow.reduce((s, e) => s + e.sat, 0);
 }
 
 /** naive sliding-window limiter: N req / 60s per ip. Noise control, not a security control. */
@@ -103,16 +131,20 @@ function rateLimited(ip, max = 60) {
 
 // trustProxy: nginx sets X-Forwarded-For; without this every request looks like 127.0.0.1
 // and the per-IP limiter would DoS itself. Header is set by OUR nginx on loopback only.
-const app = Fastify({ logger: false, bodyLimit: 64 * 1024, trustProxy: true, maxParamLength: 2000 });
+const app = Fastify({ logger: false, bodyLimit: 64 * 1024, trustProxy: true, routerOptions: { maxParamLength: 2000 } });
 
 // --- auth: the LNDhub token IS the credential ("login:password"), no sessions/db.
 app.addHook('onRequest', async (req, reply) => {
   if (rateLimited(req.ip)) return reply.code(429).send({ error: true, code: 6, message: 'rate limited' });
 
-  if (req.url.startsWith('/api/auth')) return; // login check happens in the handler
+  // F6: exact match (query string allowed) — a future /api/anything route must
+  // not silently inherit the auth exemption via prefix match.
+  if (req.url === '/api/auth' || req.url.startsWith('/api/auth?')) return;
 
   const hdr = req.headers.authorization ?? '';
-  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : (req.query.access_token ?? '');
+  // F3: Authorization header ONLY. The old ?access_token= fallback leaked the
+  // bearer credential into nginx access logs (URLs are logged verbatim).
+  const token = hdr.startsWith('Bearer ') ? hdr.slice(7) : '';
   if (!ctEqual(token, EXPECTED_TOKEN))
     return reply.code(401).send({ error: true, code: 1, message: 'Bad auth' });
 });
@@ -268,10 +300,22 @@ async function payBolt11(bolt11, reply) {
   if (CFG.maxPaymentSats > 0 && amtSat > CFG.maxPaymentSats)
     return reply.code(400).send({ error: true, code: 2, message: `amount ${amtSat} exceeds MAX_PAYMENT_SATS=${CFG.maxPaymentSats}` });
 
+  if (CFG.maxDailySats > 0 && spentToday() + amtSat > CFG.maxDailySats)
+    return reply.code(400).send({ error: true, code: 2, message: `daily cap: ${spentToday()} + ${amtSat} exceeds MAX_DAILY_SATS=${CFG.maxDailySats}` });
+
   audit({ event: 'pay_attempt', amt_sat: amtSat, payment_hash: decoded.payment_hash, destination: decoded.destination });
   try {
-    const res = await lnd('POST', '/v2/router/send', { payment_request: bolt11, timeout_seconds: 120 });
+    // F2: LND's default routing-fee budget is ~0 sats, so multi-hop payments would
+    // fail NO_ROUTE. Allow 1% of amount (floor 1000 sats, ceiling 5000 sats).
+    const feeLimitSat = Math.min(5000, Math.max(1000, Math.ceil(amtSat * 0.01)));
+    const res = await lnd('POST', '/v2/router/send', {
+      payment_request: bolt11,
+      timeout_seconds: 120,
+      no_inflight_updates: true,   // only the final status event
+      fee_limit_msat: String(BigInt(feeLimitSat) * 1000n),
+    });
     const succeeded = res.status === 'SUCCEEDED';
+    if (succeeded) recordSpend(amtSat);
     audit({ event: 'pay_result', status: res.status, amt_sat: amtSat, payment_hash: res.payment_hash ?? decoded.payment_hash });
     if (!succeeded)
       return reply.code(502).send({

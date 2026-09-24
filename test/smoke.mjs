@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 const LOGIN = 'a'.repeat(36);
 const PASSWORD = 'b'.repeat(64);
 const MAC = 'deadbeef';
-let pass = 0, fail = 0;
+let pass = 0, fail = 0, lastSendBody = null;
 const ok = (name, cond) => { cond ? pass++ : fail++; console.log(`${cond ? 'PASS' : 'FAIL'}  ${name}`); };
 
 // ---- mock LND
@@ -17,8 +17,15 @@ const routes = {
   'GET /v1/invoices': () => ({ invoices: [{ r_hash: '/wAA', payment_request: 'lnbcRECV', add_index: '7', memo: 'hi', value: '5', settled: false, timestamp: 1700000000 }] }),
   'GET /v1/payments': () => ({ payments: [{ payment_hash: 'ff00', value: '20000', fee: '1', creation_date: '1700000000', status: 'SUCCEEDED', payment_request: 'lnbcVALID' }] }),
   'POST /v2/router/send': (b) => {
-    if (b.payment_request === 'lnbcVALID' || b.payment_request === 'lnbcSMALL') return { status: 'SUCCEEDED', payment_preimage: 'aa', payment_hash: 'ff00', payment_route: { total_fees: 1 } };
-    return { status: 'FAILED', failure_reason: 'no route' };
+    lastSendBody = b;
+    // F1 regression: real LND streams NDJSON, one {"result":...} per line.
+    // Mock returns raw multi-line body; server must parse LAST line + unwrap .result.
+    if (b.payment_request === 'lnbcVALID' || b.payment_request === 'lnbcSMALL')
+      return { ndjson: [
+        { result: { payment_hash: 'ff00', status: 'IN_FLIGHT' } },
+        { result: { payment_hash: 'ff00', status: 'SUCCEEDED', payment_preimage: 'aa', payment_route: { total_fees: 1 } } },
+      ]};
+    return { ndjson: [{ result: { payment_hash: 'ff00', status: 'FAILED', failure_reason: 'FAILURE_REASON_NO_ROUTE' } }] };
   },
 };
 // dynamic: GET /v1/payreq/<bolt11> and GET /v2/invoices/lookup?payment_hash=<b64>
@@ -50,7 +57,8 @@ const mock = createServer((req, res) => {
     try {
       const out = h(body ? JSON.parse(body) : undefined);
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify(out));
+      if (out && out.ndjson) res.end(out.ndjson.map((l) => JSON.stringify(l)).join('\n') + '\n');
+      else res.end(JSON.stringify(out));
     } catch (e) { res.writeHead(500); res.end(JSON.stringify({ error: e.message })); }
   });
 });
@@ -110,6 +118,14 @@ try {
   ok('sendcoins refuses on-chain address', r.status === 400);
   r = await call('POST', '/payinvoice', { body: { invoice: 'lnbcBOGUS' } });
   ok('payinvoice invalid bolt11 -> 400', r.status === 400);
+
+  // F1: the under-cap test above only passes if NDJSON (multi-line {"result":...})
+  // was parsed and unwrapped — pre-fix it 502'd here.
+  // F2: fee_limit_msat (5000 sat payment -> floor 1000 sat -> 1000000 msat) + final-event-only flag
+  ok('F2: fee_limit_msat + no_inflight_updates sent', lastSendBody && lastSendBody.fee_limit_msat === '1000000' && lastSendBody.no_inflight_updates === true);
+  // F3: query-string token no longer accepted (was a log-leak path)
+  r = await fetch(`${B}/balance?access_token=${LOGIN}:${PASSWORD}`);
+  ok('F3: query-string token rejected', r.status === 401);
 
   // allow-by-construction: no passthrough to unlocker or anything else
   r = await call('GET', '/v1/changepassword');
