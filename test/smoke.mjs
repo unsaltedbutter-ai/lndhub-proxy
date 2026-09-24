@@ -13,26 +13,38 @@ const ok = (name, cond) => { cond ? pass++ : fail++; console.log(`${cond ? 'PASS
 const routes = {
   'GET /v1/getinfo': () => ({ identity_pubkey: '03aa', alias: 'test', num_active_channels: 1, num_peers: 2, num_pending_channels: 0, synced_to_chain: true, block_height: 968000, block_hash: '00', version: '0.21.3', chains: ['bitcoin'], uris: [] }),
   'GET /v1/balance/channels': () => ({ balance: '798976' }),
-  'POST /v1/decodepayreq': (b) => {
-    const amt = b.pay_req === 'lnbcVALID' ? '20000' : b.pay_req === 'lnbcSMALL' ? '5000' : null;
-    if (!amt) { const e = new Error('nope'); throw e; }
-    return { destination: '03bb', payment_hash: 'ff00', num_satoshis: amt, timestamp: '1700000000', expiry: '3600', description: 'test', cltv_expiry: '80' };
-  },
-  'GET /v2/invoices/lookup?payment_hash=ff00': () => ({ settled: true, payment_request: 'lnbcVALID' }),
-  'GET /v2/invoices/lookup?payment_hash=missing': () => { throw new Error('404'); },
-  'POST /v2/invoices': () => ({ r_hash: '/wAA', payment_request: 'lnbcRECV', add_index: '7', payment_addr: 'abc' }),
-  'GET /v2/invoices/incoming': () => ({ invoices: [{ r_hash: '/wAA', payment_request: 'lnbcRECV', add_index: '7', memo: 'hi', value_msat: '5000', settled: false, create_time_ns: '1700000000000000000' }] }),
-  'GET /v2/payments': () => ({ payments: [{ payment_hash: 'ff00', value_msat: '20000000', fee_msat: '1000', creation_time_ns: '1700000000000000000', status: 'SUCCEEDED' }] }),
+  'POST /v1/invoices': () => ({ r_hash: '/wAA', payment_request: 'lnbcRECV', add_index: '7', r_preimage: 'aaa' }),
+  'GET /v1/invoices': () => ({ invoices: [{ r_hash: '/wAA', payment_request: 'lnbcRECV', add_index: '7', memo: 'hi', value: '5', settled: false, timestamp: 1700000000 }] }),
+  'GET /v1/payments': () => ({ payments: [{ payment_hash: 'ff00', value: '20000', fee: '1', creation_date: '1700000000', status: 'SUCCEEDED', payment_request: 'lnbcVALID' }] }),
   'POST /v2/router/send': (b) => {
     if (b.payment_request === 'lnbcVALID' || b.payment_request === 'lnbcSMALL') return { status: 'SUCCEEDED', payment_preimage: 'aa', payment_hash: 'ff00', payment_route: { total_fees: 1 } };
     return { status: 'FAILED', failure_reason: 'no route' };
   },
 };
+// dynamic: GET /v1/payreq/<bolt11> and GET /v2/invoices/lookup?payment_hash=<b64>
+function dynamic(req) {
+  const u = req.url;
+  if (u.startsWith('/v1/payreq/')) {
+    const bolt = decodeURIComponent(u.slice('/v1/payreq/'.length));
+    const amt = bolt === 'lnbcVALID' ? '20000' : bolt === 'lnbcSMALL' ? '5000' : null;
+    if (!amt) return { status: 400, body: { error: 'nope' } };
+    return { status: 200, body: { destination: '03bb', payment_hash: 'ff00', num_satoshis: amt, timestamp: '1700000000', expiry: '3600', description: 'test', cltv_expiry: '80' } };
+  }
+  if (u.startsWith('/v2/invoices/lookup')) {
+    const q = new URLSearchParams(u.split('?')[1] ?? '');
+    const hex = Buffer.from(q.get('payment_hash') ?? '', 'base64').toString('hex');
+    if (hex === 'ff00') return { status: 200, body: { settled: true, payment_request: 'lnbcVALID' } };
+    return { status: 404, body: { code: 5, message: 'Not Found' } };
+  }
+  return null;
+}
 const mock = createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
   req.on('end', () => {
     const key = `${req.method} ${req.url}`;
+    const dyn = dynamic(req);
+    if (dyn) { res.writeHead(dyn.status, { 'content-type': 'application/json' }); res.end(JSON.stringify(dyn.body)); return; }
     const h = routes[key] ?? routes[`${req.method} ${req.url.split('?')[0]}`];
     if (!h) { res.writeHead(404); res.end(JSON.stringify({ error: 'mock: ' + key })); return; }
     try {

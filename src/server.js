@@ -162,7 +162,7 @@ app.get('/api/getpending', async () => []);
 // --- GET /api/decodeinvoice/:bolt11 -> LND /v1/decodepayreq
 app.get('/api/decodeinvoice/:invoice', async (req, reply) => {
   try {
-    const d = await lnd('POST', '/v1/decodepayreq', { pay_req: req.params.invoice });
+    const d = await lnd('GET', `/v1/payreq/${encodeURIComponent(req.params.invoice)}`);
     return {
       destination: d.destination,
       payment_hash: d.payment_hash,
@@ -184,7 +184,8 @@ app.get('/api/decodeinvoice/:invoice', async (req, reply) => {
 // --- GET /api/checkinvoice/:hash -> invoice settled?
 app.get('/api/checkinvoice/:hash', async (req, reply) => {
   try {
-    const inv = await lnd('GET', `/v2/invoices/lookup?payment_hash=${encodeURIComponent(req.params.hash)}`);
+    const b64 = Buffer.from(req.params.hash, 'hex').toString('base64');
+    const inv = await lnd('GET', `/v2/invoices/lookup?payment_hash=${encodeURIComponent(b64)}`);
     return { paid: Boolean(inv.settled) };
   } catch {
     return reply.code(404).send({ paid: false });
@@ -195,9 +196,9 @@ app.get('/api/checkinvoice/:hash', async (req, reply) => {
 app.post('/api/addinvoice', async (req, reply) => {
   const { amt, memo, expiry } = req.body ?? {};
   try {
-    const inv = await lnd('POST', '/v2/invoices', {
+    const inv = await lnd('POST', '/v1/invoices', {
       memo: String(memo ?? ''),
-      value_msat: String(BigInt(Math.trunc(Number(amt) || 0)) * 1000n),
+      value: String(Math.trunc(Number(amt) || 0)),
       expiry: String(expiry ?? 3600),
     });
     return {
@@ -213,16 +214,16 @@ app.post('/api/addinvoice', async (req, reply) => {
 
 // --- GET /api/getuserinvoices -> incoming invoices
 app.get('/api/getuserinvoices', async () => {
-  const { invoices = [] } = await lnd('GET', '/v2/invoices/incoming?limit=100&index_offset=0');
+  const { invoices = [] } = await lnd('GET', '/v1/invoices');
   return invoices.map((i) => ({
     r_hash: b64hex(i.r_hash),
     payment_request: i.payment_request,
     add_index: i.add_index,
     description: i.memo,
-    amt: Number(i.value_msat ?? 0) / 1000,
+    amt: Number(i.value ?? 0),
     ispaid: Boolean(i.settled),
-    expire_date: i.create_time_ns
-      ? new Date(Number(BigInt(i.create_time_ns) / 1_000_000n) + 3_600_000).toISOString()
+    expire_date: i.timestamp
+      ? new Date((Number(i.timestamp) + 3_600) * 1000).toISOString()
       : undefined,
   })).reverse(); // newest first
 });
@@ -231,19 +232,17 @@ app.get('/api/getuserinvoices', async () => {
 app.get('/api/gettxs', async (req) => {
   const limit = Math.min(Number(req.query.limit ?? 100), 500);
   const offset = Number(req.query.offset ?? 0);
-  const { payments = [] } = await lnd(
-    'GET', `/v2/payments?limit=${limit}&index_offset=${offset}&include_incomplete=false`);
+  const all = await lnd('GET', '/v1/payments');
+  const payments = (all.payments ?? []).filter((p) => p.status === 'SUCCEEDED').slice(offset, offset + limit);
   return payments.map((p) => ({
     type: 'paid_invoice',
     ispaid: true,
     payment_hash: p.payment_hash,
     txid: p.payment_hash,
-    amt: Number(p.value_sat ?? (Number(p.value_msat ?? 0) / 1000)),
-    fee: Number(p.fee_sat ?? (Number(p.fee_msat ?? 0) / 1000)),
-    fee_sat: Number(p.fee_sat ?? 0),
-    timestamp: p.creation_time_ns
-      ? Number(BigInt(p.creation_time_ns) / 1_000_000_000n)
-      : 0,
+    amt: Number(p.value ?? 0),
+    fee: Number(p.fee ?? 0),
+    fee_sat: Number(p.fee ?? 0),
+    timestamp: Number(p.creation_date ?? 0),
     memo: p.payment_request ? undefined : undefined,
     description: p.payment_request ? undefined : 'payment',
     value: Number(p.value_msat ?? 0),
@@ -256,7 +255,7 @@ async function payBolt11(bolt11, reply) {
     return reply.code(400).send({ error: true, code: 4, message: 'missing invoice' });
 
   let decoded;
-  try { decoded = await lnd('POST', '/v1/decodepayreq', { pay_req: bolt11 }); }
+  try { decoded = await lnd('GET', `/v1/payreq/${encodeURIComponent(bolt11)}`); }
   catch (e) { return reply.code(400).send({ error: true, code: 4, message: `not a valid invoice: ${e.message}` }); }
 
   const amtSat = Number(decoded.num_satoshis ?? 0);
