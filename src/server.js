@@ -214,8 +214,8 @@ app.post('/api/addinvoice', async (req, reply) => {
 
 // --- GET /api/getuserinvoices -> incoming invoices
 app.get('/api/getuserinvoices', async () => {
-  // reverse=true: without it, v1 returns the OLDEST 100 and new invoices never show up
-  const { invoices = [] } = await lnd('GET', '/v1/invoices?reverse=true&num_max_invoices=100');
+  // LND's v1 reverse=true is unreliable here; fetch and sort by add_index desc in-proxy.
+  const { invoices = [] } = await lnd('GET', '/v1/invoices?num_max_invoices=1000');
   return invoices.map((i) => ({
     r_hash: b64hex(i.r_hash),
     payment_request: i.payment_request,
@@ -226,7 +226,7 @@ app.get('/api/getuserinvoices', async () => {
     expire_date: i.timestamp
       ? new Date((Number(i.timestamp) + 3_600) * 1000).toISOString()
       : undefined,
-  })).reverse(); // newest first
+  })).sort((a, b) => Number(b.add_index) - Number(a.add_index)); // newest first
 });
 
 // --- GET /api/gettxs -> outgoing payments
