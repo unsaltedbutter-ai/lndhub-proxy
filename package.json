@@ -1,6 +1,6 @@
 {
   "name": "lndhub-proxy",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "Minimal, allow-by-construction LNDhub API proxy for a single LND node. No database, no accounts, no on-chain endpoints.",
   "license": "MIT",
   "type": "module",
